@@ -26,6 +26,13 @@ plots/**
 /obsidian
 /log
 
+# Local inference and CUDA build artifacts
+/.torch_extensions/
+/scene.ply
+/turntable.mp4
+/import
+/uv.lock
+
 # experiments runtime state
 experiments/.registry.json
 
