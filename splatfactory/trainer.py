@@ -364,6 +364,8 @@ class Trainer:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             if "lr_scheduler" in checkpoint:
                 self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+            if "scaler" in checkpoint:
+                self.scaler.load_state_dict(checkpoint["scaler"])
             self.epoch = checkpoint["epoch"]
             for metric in ["tot_it", "tot_n_samples"]:
                 if metric in checkpoint:
@@ -421,6 +423,7 @@ class Trainer:
                 custom={
                     "tot_it": self.tot_it,
                     "tot_n_samples": self.tot_n_samples,
+                    "scaler": self.scaler.state_dict(),
                 },
                 distributed=self.distributed,
                 best_eval=best_eval,
@@ -1308,7 +1311,9 @@ def launch_training(output_dir: Path, conf: DictConfig, device: torch.device):
     # Create separate dataset instances for train and val splits
     DatasetClass = datasets.get_dataset(data_conf.name)
     train_dataset = DatasetClass(data_conf, split="train")
-    val_dataset = DatasetClass(data_conf, split="val")
+    # Optional held-out validation sampler; training keeps its original sampler.
+    val_data_conf = OmegaConf.merge(data_conf, data_conf.get("val_overrides", {}))
+    val_dataset = datasets.get_dataset(val_data_conf.name)(val_data_conf, split="val")
 
     if conf.train.get("reload_model"):
         assert conf.train.load_experiment is not None

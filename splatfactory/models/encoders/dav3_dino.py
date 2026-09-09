@@ -72,6 +72,7 @@ class DAV3DinoVisionTransformer(BaseModel):
         "patch_start_idx": 1,
         "cat_token": True,
         "use_checkpoint": False,
+        "num_scene_tokens": 0,
         # Output settings
         "out_layers": [23],
     }
@@ -85,6 +86,11 @@ class DAV3DinoVisionTransformer(BaseModel):
         self.num_heads = conf.num_heads
         self.patch_size = conf.patch_size
         self.num_register_tokens = conf.num_register_tokens
+        if conf.patch_start_idx not in (1, 1 + self.num_register_tokens):
+            raise ValueError("patch_start_idx must match CLS/register layout")
+        self.scene_start_idx = 1 + self.num_register_tokens
+        self.num_scene_tokens = conf.num_scene_tokens
+        self.patch_start_idx = self.scene_start_idx + self.num_scene_tokens
         self.interpolate_antialias = conf.interpolate_antialias
         self.interpolate_offset = conf.interpolate_offset
         self.alt_start = conf.alt_start
@@ -161,6 +167,9 @@ class DAV3DinoVisionTransformer(BaseModel):
 
         self.blocks = nn.ModuleList(blocks_list)
         self.norm = norm_layer(conf.embed_dim)
+        from zipsplat.scene_tokens import make_scene_tokens
+
+        self.scene_tokens = make_scene_tokens(self.num_scene_tokens, self.embed_dim)
 
     def interpolate_pos_encoding(self, x, w, h):
         previous_dtype = x.dtype
@@ -216,6 +225,10 @@ class DAV3DinoVisionTransformer(BaseModel):
                 ),
                 dim=1,
             )
+        if self.scene_tokens is not None:
+            start = self.scene_start_idx
+            slots = self.scene_tokens.to(dtype=x.dtype).unsqueeze(0).expand(B * S, -1, -1)
+            x = torch.cat((x[:, :start], slots, x[:, start:]), dim=1)
         x = rearrange(x, "(b s) n c -> b s n c", b=B, s=S)
         return x
 
@@ -228,11 +241,9 @@ class DAV3DinoVisionTransformer(BaseModel):
             )
             pos = rearrange(pos, "(b s) n c -> b s n c", b=B)
             pos_nodiff = torch.zeros_like(pos).to(pos.dtype)
-            if self.conf.patch_start_idx > 0:
+            if self.patch_start_idx > 0:
                 pos = pos + 1
-                pos_special = (
-                    torch.zeros(B * S, self.conf.patch_start_idx, 2).to(device).to(pos.dtype)
-                )
+                pos_special = torch.zeros(B * S, self.patch_start_idx, 2).to(device).to(pos.dtype)
                 pos_special = rearrange(pos_special, "(b s) n c -> b s n c", b=B)
                 pos = torch.cat([pos_special, pos], dim=2)
                 pos_nodiff = pos_nodiff + 1
@@ -262,7 +273,7 @@ class DAV3DinoVisionTransformer(BaseModel):
                     src_token = self.camera_token[:, 1:].expand(B, S - 1, -1)
                     cam_token = torch.cat([ref_token, src_token], dim=1)
                     logger.debug("Using learned camera conditions")
-                x[:, :, 0] = cam_token
+                x = torch.cat((cam_token.unsqueeze(2), x[:, :, 1:]), dim=2)
 
             is_global = self.alt_start != -1 and i >= self.alt_start and i % 2 == 1
             attn_type = "global" if is_global else "local"
@@ -337,8 +348,10 @@ class DAV3DinoVisionTransformer(BaseModel):
         else:
             raise ValueError(f"Invalid output shape: {outputs[0][1].shape}")
         aux_outputs = [self.norm(out) for out in aux_outputs]
-        outputs = [out[..., 1 + self.num_register_tokens :, :] for out in outputs]
-        aux_outputs = [out[..., 1 + self.num_register_tokens :, :] for out in aux_outputs]
+        start = self.scene_start_idx
+        stop = start + self.num_scene_tokens if self.num_scene_tokens else None
+        outputs = [out[..., start:stop, :] for out in outputs]
+        aux_outputs = [out[..., start:stop, :] for out in aux_outputs]
         return tuple(zip(outputs, camera_tokens)), aux_outputs
 
     def _forward(self, data):

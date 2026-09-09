@@ -111,11 +111,21 @@ class TensorWrapper(TensorClass, tensor_only=True):
                 result_data = torch.cat(data_list, *args[1:], **(kwargs or {}))
                 return cls(result_data)
 
-        # Handle torch.stack for tensordict 0.9.0 compatibility
-        if func.__name__ == "stack" and args and isinstance(args[0], list):
-            if hasattr(args[0][0], "_tensordict"):
-                from tensordict import stack as td_stack
-
-                return td_stack(args[0], *args[1:], **(kwargs or {}))
+        # Stack packed tensors directly: tensordict.stack may dispatch back to
+        # torch.stack and recursively re-enter this override. Wrapper dimensions
+        # exclude the final packed feature dimension, including for negative dim.
+        if func == torch.stack and args and isinstance(args[0], (list, tuple)):
+            if args[0] and all(isinstance(x, cls) for x in args[0]):
+                options = dict(kwargs or {})
+                dim = args[1] if len(args) > 1 else options.pop("dim", 0)
+                ndim = args[0][0].data_.ndim - 1
+                if dim < -ndim - 1 or dim > ndim:
+                    raise IndexError(f"Stack dimension {dim} out of range for {ndim} batch dimensions")
+                dim = dim % (ndim + 1)
+                out = options.pop("out", None)
+                if out is not None:
+                    options["out"] = out.data_
+                result = torch.stack([x.data_ for x in args[0]], dim=dim, **options)
+                return out if out is not None else cls(result)
 
         return getattr(cls, func.__name__)(*args, **(kwargs or {}))

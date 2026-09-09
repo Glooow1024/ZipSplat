@@ -24,11 +24,10 @@ _WEIGHTS_URLS: Dict[str, str] = {
 }
 
 
-def _load_state_dict(weights: str) -> Dict[str, Any]:
-    """Resolve `weights` (registry name / path / URL) to a model state dict.
+def _load_checkpoint(weights: str) -> Dict[str, Any]:
+    """Resolve `weights` (registry name / path / URL), retaining architecture metadata.
 
-    Loads `.tar` checkpoints and returns their "model" entry. Uses weights_only=False, so only
-    load trusted checkpoints.
+    Uses weights_only=False, so only load trusted checkpoints.
     """
     if weights in _WEIGHTS_URLS:
         weights = _WEIGHTS_URLS[weights]
@@ -44,7 +43,57 @@ def _load_state_dict(weights: str) -> Dict[str, Any]:
         ckpt = torch.load(weights, map_location="cpu", weights_only=False)
     else:
         raise ValueError(f"Invalid weights {weights!r}: not a registry name, path, or URL.")
+    return ckpt
+
+
+def _load_state_dict(weights: str) -> Dict[str, Any]:
+    ckpt = _load_checkpoint(weights)
     return ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+
+
+def _model_conf_from_checkpoint(checkpoint):
+    if "model_conf" in checkpoint:
+        return dict(checkpoint["model_conf"])
+    training = checkpoint.get("conf", {}).get("model", {})
+    if not training.get("scene_tokens_enabled", False):
+        return {}
+    backbone = training["backbone"]
+    variant = backbone["vit_name"]
+    schedules = {"vits": 4, "vitb": 4, "vitl": 8, "vitg": 13}
+    dimensions = {"vits": 384, "vitb": 768, "vitl": 1024, "vitg": 1536}
+    if (
+        variant not in schedules
+        or any(
+            backbone.get(key, schedules.get(variant)) != schedules.get(variant)
+            for key in ("alt_start", "qknorm_start", "rope_start")
+        )
+        or training.get("num_heads", dimensions.get(variant, 0) // 64)
+        != dimensions.get(variant, 0) // 64
+    ):
+        raise ValueError(
+            "Scene checkpoint backbone/attention configuration differs from standalone variant"
+        )
+    # The standalone decoder implements this released architecture only.
+    if (
+        not training.get("with_color_skip", True)
+        or training.get("scene_init_layer", 0) != 0
+        or training.get("mlp_ratio", 4.0) != 4.0
+        or not training["backbone"].get("cat_token", True)
+        or training.get("scene_position_strategy", "zero") != "zero"
+        or training.get("scene_color_query_source", "geometry") != "geometry"
+    ):
+        raise ValueError(
+            "This scene checkpoint uses an unsupported standalone decoder configuration"
+        )
+    return {
+        "scene_tokens_enabled": True,
+        "num_scene_tokens": training["num_scene_tokens"],
+        "vit_name": training["backbone"]["vit_name"],
+        "out_layers": tuple(training["backbone"]["out_layers"]),
+        "gaussians_per_token": training["gaussians_per_prototype"],
+        "sh_degree": training["gaussian_head"]["sh_degree"],
+        "color_skip_dim": training["color_skip_dim"],
+    }
 
 
 class ZipSplat(nn.Module):
@@ -66,10 +115,37 @@ class ZipSplat(nn.Module):
         >>> viz.turntable(gaussians, "turntable.mp4", sweep_deg=None)  # wiggle orbit video
     """
 
-    def __init__(self, weights: str = "zipsplat") -> None:
+    def __init__(
+        self,
+        weights: str = "zipsplat",
+        *,
+        scene_tokens_enabled: Optional[bool] = None,
+        num_scene_tokens: Optional[int] = None,
+        scene_token_init_from_base: bool = False,
+        use_checkpoint: bool = False,
+    ) -> None:
         super().__init__()
-        self.model = Model()
-        self.model.flexible_load(_load_state_dict(weights))
+        checkpoint = _load_checkpoint(weights)
+        conf = _model_conf_from_checkpoint(checkpoint)
+        for key, value in (
+            ("scene_tokens_enabled", scene_tokens_enabled),
+            ("num_scene_tokens", num_scene_tokens),
+        ):
+            if value is not None:
+                if key in conf and conf[key] != value:
+                    raise ValueError(f"{key}={value} conflicts with checkpoint value {conf[key]}")
+                conf[key] = value
+        conf["scene_token_init_from_base"] = scene_token_init_from_base
+        conf["use_checkpoint"] = use_checkpoint
+        self.model = Model(**conf)
+        state = checkpoint["model"] if "model" in checkpoint else checkpoint
+        self.model.flexible_load(state)
+
+    def save_checkpoint(self, path: Union[str, Path]) -> None:
+        """Save weights together with the architecture required to reload scene slots."""
+        conf = dict(self.model.conf)
+        conf["scene_token_init_from_base"] = False
+        torch.save({"model": self.model.state_dict(), "model_conf": conf}, path)
 
     def _prepare_inputs(
         self,

@@ -95,6 +95,7 @@ class DAV3Encoder(BaseModel):
         "cat_token": True,
         "use_checkpoint": False,
         "with_camera_enc": False,
+        "num_scene_tokens": 0,
     }
 
     def _init(self, conf):
@@ -110,6 +111,7 @@ class DAV3Encoder(BaseModel):
             rope_start=conf.rope_start,
             cat_token=conf.cat_token,
             use_checkpoint=conf.use_checkpoint,
+            num_scene_tokens=conf.num_scene_tokens,
         )
 
         self.embed_dim = self.backbone.embed_dim

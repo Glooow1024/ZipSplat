@@ -75,6 +75,12 @@ class ZipSplat(nn.Module):
         "vit_name": "vitg",
         "patch_size": 14,
         "out_layers": (19, 29, 39),
+        "scene_tokens_enabled": False,
+        "num_scene_tokens": 256,
+        "scene_token_init_from_base": False,
+        "scene_position_strategy": "zero",
+        "scene_color_query_source": "geometry",
+        "use_checkpoint": False,
         # gaussian head
         "gaussians_per_token": 32,
         "sh_degree": 1,
@@ -86,12 +92,24 @@ class ZipSplat(nn.Module):
     def __init__(self, **conf) -> None:
         super().__init__()
         self.conf = {**self.default_conf, **conf}
+        from zipsplat.scene_tokens import scene_count
+
+        count = scene_count(self.conf["scene_tokens_enabled"], self.conf["num_scene_tokens"])
+        if count and (
+            self.conf["scene_position_strategy"] != "zero"
+            or self.conf["scene_color_query_source"] != "geometry"
+        ):
+            raise ValueError(
+                "Only zero-position scene slots and geometry color queries are supported"
+            )
 
         self.backbone = DAV3Encoder(
             vit_name=self.conf["vit_name"],
             out_layers=self.conf["out_layers"],
             with_camera_enc=True,
             patch_size=self.conf["patch_size"],
+            num_scene_tokens=count,
+            use_checkpoint=self.conf["use_checkpoint"],
         )
         D = self.backbone.embed_dim
         L = len(self.conf["out_layers"])
@@ -140,9 +158,14 @@ class ZipSplat(nn.Module):
             gaussians_per_token=self.conf["gaussians_per_token"],
             sh_degree=self.conf["sh_degree"],
         )
+        self.scene_color_query = nn.Linear(D, self.conf["color_skip_dim"]) if count else None
 
     def flexible_load(self, state_dict: Dict[str, Any]) -> None:
         """Load a state dict tolerantly: strip DDP `module.` prefix, non-strict, warn on diffs."""
+        if self.conf["scene_tokens_enabled"] or any(".scene_tokens" in k for k in state_dict):
+            from zipsplat.scene_tokens import load_scene_state
+
+            return load_scene_state(self, state_dict, self.conf["scene_token_init_from_base"])
         if any(k.startswith("module.") for k in state_dict):
             state_dict = {k.removeprefix("module."): v for k, v in state_dict.items()}
         missing, unexpected = self.load_state_dict(state_dict, strict=False)
@@ -181,6 +204,8 @@ class ZipSplat(nn.Module):
         """
         B, V, T, _ = tokens.shape
         VT = V * T
+        if self.conf["scene_tokens_enabled"] and compression != 1.0:
+            raise ValueError("Scene-token mode requires compression=1.0 (no second k-means)")
         K = max(1, int(VT * compression))
         if K >= VT:
             return torch.arange(VT, device=tokens.device).unsqueeze(0).expand(B, -1)
@@ -202,11 +227,15 @@ class ZipSplat(nn.Module):
             scene = self.self_attention[l](scene)
         return scene
 
-    def _color(self, images: Tensor, nearest_idx: Tensor) -> Tensor:
+    def _color(self, images: Tensor, nearest_idx: Tensor, scene: Optional[Tensor] = None) -> Tensor:
         """Color skip: PatchEmbed all views, gather at shared k-means indices, CA in color_skip_dim."""
         B = images.shape[0]
         flat_imgs = rearrange(images, "B V C H W -> (B V) C H W")
         color_tokens = rearrange(self.color_embed(flat_imgs), "(B V) T D -> B (V T) D", B=B)
+        if self.scene_color_query is not None:
+            if scene is None:
+                raise ValueError("Scene geometry is required for scene-token color queries")
+            return self.color_cross_attention(self.scene_color_query(scene), color_tokens)
         D_c = color_tokens.shape[-1]
         idx = nearest_idx.unsqueeze(-1).expand(-1, -1, D_c)
         return self.color_cross_attention(torch.gather(color_tokens, 1, idx), color_tokens)
@@ -233,11 +262,17 @@ class ZipSplat(nn.Module):
         Returns:
             Gaussians with batch shape (B, N_gaussians).
         """
+        if self.conf["scene_tokens_enabled"] and compression != 1.0:
+            raise ValueError("Scene-token mode requires compression=1.0 (no second k-means)")
         prior_pose, prior_camera = (poses, cameras) if use_priors else (None, None)
         features = self._backbone_features(images, prior_camera, prior_pose)
         layer_tokens = self._prepare(features)
         # K-means runs on the deepest (last) layer.
         nearest_idx = self._cluster(layer_tokens[0], compression)
         scene = self._fuse(layer_tokens, nearest_idx)
-        color_feats = self._color(images, nearest_idx)
+        color_feats = self._color(images, nearest_idx, scene)
+        if self.conf["scene_tokens_enabled"]:
+            # Match the training head's FP32 policy under mixed precision.
+            with torch.autocast(images.device.type, enabled=False):
+                return self.gaussian_head(torch.cat([scene, color_feats], dim=-1).float())
         return self.gaussian_head(torch.cat([scene, color_feats], dim=-1))

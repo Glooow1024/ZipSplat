@@ -27,6 +27,7 @@ plots/**
 /log
 
 # Local inference and CUDA build artifacts
+/results/scene_token/
 /.torch_extensions/
 /scene.ply
 /turntable.mp4

@@ -25,6 +25,7 @@ scikit-image
 scikit-learn
 tabulate
 tensordict
+tensorboard
 wandb
 huggingface-hub
 pillow

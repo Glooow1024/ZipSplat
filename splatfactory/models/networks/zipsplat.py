@@ -55,6 +55,13 @@ class ZipSplat(BaseModel):
             "use_checkpoint": False,
         },
         "img_size": 252,
+        "scene_tokens_enabled": False,
+        "num_scene_tokens": 256,
+        "scene_token_init_from_base": False,
+        "scene_position_strategy": "zero",
+        "scene_color_query_source": "geometry",
+        "freeze_backbone_except_scene": False,
+        "train_prior_probability": 0.2,
         "eval_use_priors": False,
         # Layer roles: indices into layer_tokens (0 = deepest backbone layer)
         "clustering_layer": 0,
@@ -103,6 +110,25 @@ class ZipSplat(BaseModel):
     # ============================================================
 
     def _init(self, conf):
+        from zipsplat.scene_tokens import scene_count
+
+        count = scene_count(conf.scene_tokens_enabled, conf.num_scene_tokens)
+        if count and (
+            conf.scene_position_strategy != "zero" or conf.scene_color_query_source != "geometry"
+        ):
+            raise ValueError(
+                "Only zero-position scene slots and geometry color queries are supported"
+            )
+        if conf.scene_tokens_enabled and (
+            list(conf.query_sample_ratio) != [1.0, 1.0]
+            or conf.query_scale_with_views != 0
+            or conf.query_ratio_schedule != 0
+        ):
+            raise ValueError(
+                "Scene-token mode requires ratio=[1,1], view scaling=0 and ratio schedule=0"
+            )
+        if not 0 <= conf.train_prior_probability <= 1:
+            raise ValueError("train_prior_probability must be in [0,1]")
         # Sets self.embed_dim, self.num_layers, self.patch_size.
         self._setup_backbone(conf)
 
@@ -121,7 +147,13 @@ class ZipSplat(BaseModel):
         self._setup_color(conf, self.embed_dim)
         self._setup_head(conf, self.embed_dim)
 
-        tokens_per_view = (conf.img_size // self.patch_size) ** 2
+        if conf.freeze_backbone_except_scene:
+            if not count:
+                raise ValueError("freeze_backbone_except_scene requires scene-token mode")
+            self.backbone.requires_grad_(False)
+            self.backbone.backbone.scene_tokens.requires_grad_(True)
+
+        tokens_per_view = count or (conf.img_size // self.patch_size) ** 2
         gs_per_view_min = int(
             tokens_per_view * conf.query_sample_ratio[0] * conf.gaussians_per_prototype
         )
@@ -138,7 +170,13 @@ class ZipSplat(BaseModel):
         )
 
     def _setup_backbone(self, conf):
-        self.backbone = DAV3Encoder(conf.backbone)
+        from omegaconf import OmegaConf
+
+        backbone_conf = OmegaConf.to_container(conf.backbone, resolve=True)
+        backbone_conf["num_scene_tokens"] = (
+            conf.num_scene_tokens if conf.scene_tokens_enabled else 0
+        )
+        self.backbone = DAV3Encoder(backbone_conf)
         self.embed_dim = self.backbone.embed_dim
         self.num_layers = len(conf.backbone.out_layers)
         self.patch_size = self.backbone.backbone.patch_size
@@ -179,6 +217,7 @@ class ZipSplat(BaseModel):
         )
 
     def _setup_color(self, conf, embed_dim):
+        self.scene_color_query = None
         self.color_embed = None
         self.color_cross_attention = None
         if not conf.with_color_skip:
@@ -199,6 +238,15 @@ class ZipSplat(BaseModel):
             qk_norm=True,
             init_values=conf.fuse_layer_scale,
         )
+        if conf.scene_tokens_enabled:
+            self.scene_color_query = nn.Linear(embed_dim, conf.color_skip_dim)
+
+    def flexible_load(self, state_dict):
+        if self.conf.scene_tokens_enabled or any(".scene_tokens" in k for k in state_dict):
+            from zipsplat.scene_tokens import load_scene_state
+
+            return load_scene_state(self, state_dict, self.conf.scene_token_init_from_base)
+        return super().flexible_load(state_dict)
 
     def _setup_head(self, conf, embed_dim):
         from splatfactory.models.decoders.gaussian_head import GaussianHead
@@ -234,7 +282,9 @@ class ZipSplat(BaseModel):
         backbone_data = {"image": data["context"]["image"]}
         if self.backbone.conf.with_camera_enc:
             use_priors = (
-                (torch.rand(1).item() < 0.2) if self.training else self.conf.eval_use_priors
+                (torch.rand(1).item() < self.conf.train_prior_probability)
+                if self.training
+                else self.conf.eval_use_priors
             )
             if use_priors and "pose" in data["context"] and "camera" in data["context"]:
                 backbone_data["use_priors"] = True
@@ -294,6 +344,11 @@ class ZipSplat(BaseModel):
         B, V, T, D = tokens.shape
         tokens_flat = rearrange(tokens, "B V T D -> B (V T) D")
         VT = V * T
+
+        if self.conf.scene_tokens_enabled:
+            # Slots are the complete geometry bottleneck; no query schedule applies.
+            idx = torch.arange(VT, device=tokens.device).unsqueeze(0).expand(B, -1)
+            return idx, idx
 
         # Read from the mutable attribute (may have been annealed by the trainer's schedule)
         ratio_min, ratio_max = self.query_sample_ratio
@@ -449,11 +504,14 @@ class ZipSplat(BaseModel):
         # Color CA as symmetric 4th "layer" - uses color features only at shared indices
         if self.conf.with_color_skip and self.color_cross_attention is not None:
             color_dim = color_tokens_full.shape[-1]
-            color_queries = torch.gather(
-                color_tokens_full,
-                1,
-                nearest_idx.unsqueeze(-1).expand(-1, -1, color_dim),
-            )
+            if self.scene_color_query is not None:
+                color_queries = self.scene_color_query(scene_tokens)
+            else:
+                color_queries = torch.gather(
+                    color_tokens_full,
+                    1,
+                    nearest_idx.unsqueeze(-1).expand(-1, -1, color_dim),
+                )
             return_attn = (not self.training) and self.conf.return_attention
             if return_attn:
                 color_feats, color_attn = self.color_cross_attention(

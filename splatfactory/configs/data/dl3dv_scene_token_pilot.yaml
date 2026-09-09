@@ -1,0 +1,38 @@
+# Only the 8+2 scene readiness pilot, not the full RE10K/DL3DV mixture.
+name: dataset_dl3dv
+dataset_dir: /data/datasets/3dvision/ZipSplat-scene-token/pilot_20260907
+train_shard_dir: ${.dataset_dir}/train
+# MultiViewDataset uses this field for split='val'; never point it at official test.
+test_shard_dir: ${.dataset_dir}/validation
+seed: 256
+batch_size: 24
+train_batch_size: 24
+val_batch_size: 1
+num_workers: 2
+image_num_range: [2, 24]
+aspect_ratio_range: [1.0, 1.0]
+num_target_views: 4
+use_relative_poses: true
+normalize_baseline: false
+random_reference_view: true
+near: 0.1
+far: 100.0
+max_pose_jump_ratio: 10.0
+preprocessing:
+  resize: 252
+  edge_divisible_by: 14
+view_sampler:
+  name: bounded
+  warm_up_steps: 0
+  min_distance_between_context_views: 8
+  initial_min_distance_between_context_views: 5
+  gap_multiplier: 11
+  max_distance_between_consecutive_views: 22
+# Applied only when constructing the validation dataset in launch_training.
+val_overrides:
+  image_num_range: [6, 6]
+  num_target_views: 8
+  random_reference_view: false
+  view_sampler:
+    name: eval_sampler
+    indices_file: /data/datasets/3dvision/ZipSplat-scene-token/pilot_20260907/validation_ctx6_tgt8.json

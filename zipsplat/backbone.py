@@ -106,6 +106,8 @@ class DAV3DinoVisionTransformer(nn.Module):
         out_layers: Sequence[int] = (5, 7, 9, 11),
         cat_token: bool = True,
         patch_start_idx: int = 1,
+        num_scene_tokens: int = 0,
+        use_checkpoint: bool = False,
     ) -> None:
         super().__init__()
         norm_layer = partial(nn.LayerNorm, eps=1e-6)
@@ -122,7 +124,12 @@ class DAV3DinoVisionTransformer(nn.Module):
         self.rope_freq = rope_freq
         self.cat_token = cat_token
         self.out_layers = list(out_layers)
-        self.patch_start_idx = patch_start_idx
+        if patch_start_idx not in (1, 1 + num_register_tokens):
+            raise ValueError("patch_start_idx must match CLS/register layout")
+        self.scene_start_idx = 1 + num_register_tokens
+        self.num_scene_tokens = num_scene_tokens
+        self.patch_start_idx = self.scene_start_idx + num_scene_tokens
+        self.use_checkpoint = use_checkpoint
         self.num_tokens = 1
 
         self.patch_embed = modules.PatchEmbed(
@@ -170,6 +177,9 @@ class DAV3DinoVisionTransformer(nn.Module):
             ]
         )
         self.norm = norm_layer(embed_dim)
+        from zipsplat.scene_tokens import make_scene_tokens
+
+        self.scene_tokens = make_scene_tokens(num_scene_tokens, embed_dim)
 
     def interpolate_pos_encoding(self, x: Tensor, w: int, h: int) -> Tensor:
         previous_dtype = x.dtype
@@ -214,6 +224,10 @@ class DAV3DinoVisionTransformer(nn.Module):
             x = torch.cat(
                 (x[:, :1], self.register_tokens.expand(x.shape[0], -1, -1), x[:, 1:]), dim=1
             )
+        if self.scene_tokens is not None:
+            start = self.scene_start_idx
+            slots = self.scene_tokens.to(dtype=x.dtype).unsqueeze(0).expand(B * S, -1, -1)
+            x = torch.cat((x[:, :start], slots, x[:, start:]), dim=1)
         return rearrange(x, "(b s) n c -> b s n c", b=B, s=S)
 
     def _prepare_rope(
@@ -221,8 +235,8 @@ class DAV3DinoVisionTransformer(nn.Module):
     ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
         """Build RoPE positions for local (`pos`) and global (`pos_nodiff`) attention.
 
-        For global attention, positions are constant within a view so RoPE acts as a
-        view-id rather than a spatial encoding. Special (CLS) tokens get position 0.
+        Global patch positions are identical across views, not unique view IDs.
+        CLS, register and scene slots get position 0; local patch positions stay intact.
         """
         if self.rope is None:
             return None, None
@@ -287,12 +301,21 @@ class DAV3DinoVisionTransformer(nn.Module):
 
         for i, blk in enumerate(self.blocks):
             if i == self.alt_start:
-                x[:, :, 0] = cam_token if cam_token is not None else self._default_cam_token(B, S)
+                camera = cam_token if cam_token is not None else self._default_cam_token(B, S)
+                # Avoid mutating an activation saved by checkpoint/autograd.
+                x = torch.cat((camera.unsqueeze(2), x[:, :, 1:]), dim=2)
 
             is_global = self.alt_start != -1 and i >= self.alt_start and i % 2 == 1
             rope_active = self.rope is not None and i >= self.rope_start
             blk_pos = (pos_nodiff if is_global else pos) if rope_active else None
-            x = self._process_attention(x, blk, is_global=is_global, pos=blk_pos)
+            if self.use_checkpoint and self.training:
+                from torch.utils.checkpoint import checkpoint
+
+                x = checkpoint(
+                    self._process_attention, x, blk, is_global, blk_pos, use_reentrant=False
+                )
+            else:
+                x = self._process_attention(x, blk, is_global=is_global, pos=blk_pos)
 
             if not is_global:
                 local_x = x
@@ -302,7 +325,10 @@ class DAV3DinoVisionTransformer(nn.Module):
                 outputs.append((out_x[:, :, 0], out_x))
 
         strip = 1 + self.num_register_tokens
-        return tuple((self._apply_norm(full)[..., strip:, :], cam_tok) for cam_tok, full in outputs)
+        stop = strip + self.num_scene_tokens if self.num_scene_tokens else None
+        return tuple(
+            (self._apply_norm(full)[..., strip:stop, :], cam_tok) for cam_tok, full in outputs
+        )
 
 
 # ---------------------------------------------------------------------------

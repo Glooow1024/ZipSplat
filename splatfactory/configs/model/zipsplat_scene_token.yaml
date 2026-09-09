@@ -1,0 +1,21 @@
+defaults:
+  - zipsplat
+  - _self_
+
+# P2/P3 model preset; data splits and training duration are configured separately.
+scene_tokens_enabled: true
+compile: false
+num_scene_tokens: 256
+scene_token_init_from_base: true
+weights: zipsplat
+backbone:
+  weights: null  # initialize from the complete ZipSplat checkpoint above
+  use_checkpoint: true
+freeze_backbone_except_scene: true  # warmup; false for joint backbone fine-tuning
+train_prior_probability: 0.0
+eval_use_priors: false
+query_sample_ratio: [1.0, 1.0]
+query_scale_with_views: 0.0
+query_ratio_schedule: 0.0
+use_checkpoint: true
+return_attention: false
