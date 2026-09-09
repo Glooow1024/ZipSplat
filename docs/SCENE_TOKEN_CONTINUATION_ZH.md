@@ -73,3 +73,16 @@ ssh vllm1 'cd /root/zipsplat/ZipSplat && rm /root/multiview_compare/experiments/
 - tests/test_training_preparation_poll.py新增6项回归测试全部通过，覆盖文件短暂消失、旧心跳保留与过期、初次无文件超时、JSON重试/持续损坏、IO重试/权限失败和成功或失败的最终summary。
 - 已确认没有训练进程/metrics，再将旧status、pipeline日志、provenance和旧脚本归档到新运行recovery_history/poll_fix_1788919868；仅修正run_training.py及其对应源码快照/hash，provenance.pretraining_repairs明确记录前后hash和原因。159个冻结源码hash重新通过，没有放开校验或修改训练配置。
 - 已重启管理程序PID29969，viewer和8个转换worker未重启。检查时progress882/1056、0转换失败；网页回到preparing_data。数据完成后仍须通过审计、恢复重放和首50步验收；不把管理器恢复称为新训练已开始。
+
+### 2026-09-09：约92700步梯度守卫报错与恢复诊断
+
+- rank2在92700步触发train_main中“每卡全部监测梯度必须>0”的assert，其他7rank已记录该步有限非零局部梯度；全局日志到92699左右，最近完整checkpoint92000。原assert未输出触发参数/数值，不能事后确定是局部零还是缺失hook，更不能直接认定模型整体梯度失效。
+- 只读单样本探针：用92000权重重放92700/rank2确定性输入（scene4ab881b3...），loss0.07253、activated约.885，六个监测梯度均有限非零。这是更早权重的探针，不是原失败状态精确重现；报告gradient_sample_probe.json留运行目录。
+- 修复检查口径：保留原局部hook，允许有限局部零值；在optimizer.step前记录DDP汇总、AMP unscale和clip之后的实际梯度。仍要求hook完整、全局实际梯度有限非零与优化器计数增加，错误保存gradient_failure_rank*.json，局部零/缺失情况写gradient_observations_rank*.jsonl；每rank日志新增optimizer_gradients，不改参数更新算法。
+- tests/test_distributed_gradient_monitor.py两项通过，其中真实2进程CPU/Gloo测试复现local0/2而汇总均1、两rank共同更新权重；缺失、NaN/Inf、全局零检查仍报错。没有因局部零而跳过batch或裁剪loss。
+- 原状态/日志/源码/provenance归档到recovery_history/gradient_fix_1788951429；仅更新train_main及对应159文件清单中的hash，provenance.repairs记录前后版本。管理器从完整92000恢复并将后续旧日志归档recovery_history/1788951452，未保留的约700步重算。新管理PID5192、torchrun5199，模型/optimizer/scaler/RNG/scheduler按既有恢复路径加载，未重启warmup。
+- 已验证恢复首步8卡实际梯度逐值相同，前10步LR与旧日志逐值相同。重放训练数值不是bitwise一致（前10步最大loss差6.4e-5、PSNR差.00765、LPIPS差.000732），不宣称精确重现原失败状态。目前已过92330且未有新错误，须继续观察原92700位置。
+- 同时只读确认原50k续训初始化continuity_check为passed、原三集合PSNR/LPIPS/total差均0；50050 checkpoint关键参数回读passed、optimizer567条。它们是先前启动验收，不是本次92000恢复的新checkpoint验收。
+
+- 恢复后已正常越过92700，最终核验status running/92740、无error_rank，159项源码hash一致。同一92700/rank2样本本次六个局部及汇总梯度均有限非零，loss .070228、activated .87636；未重现原断言，也没有局部零观察记录。不能声称已确定原故障是哪个参数的零梯度。本轮已修正不合理的逐卡非零判据并补齐诊断，但原始异常的具体数值原因未被精确复现。
+- gradient_fix_verification.json记录越过原失败步及完整该rank指标；模型结构/数据/loss/LR配置不变，训练继续后台运行，后续每2000步checkpoint策略保持。

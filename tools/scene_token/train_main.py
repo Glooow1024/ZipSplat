@@ -33,6 +33,13 @@ def migrate_optimizer(model,optimizer,saved):
     optimizer.load_state_dict(current)
     return matched
 
+def validate_gradient_observation(local,applied,tracked):
+    """A rank-local zero is valid; require connected, finite optimizer gradients."""
+    assert set(local)==set(tracked),f'Missing local gradient hooks: {set(tracked)-set(local)}'
+    assert all(math.isfinite(v) and v>=0 for v in local.values()),f'Invalid local gradients: {local}'
+    assert set(applied)==set(tracked),f'Missing optimizer gradients: {set(tracked)-set(applied)}'
+    assert all(math.isfinite(v) and v>0 for v in applied.values()),f'Invalid reduced optimizer gradients: {applied}; local={local}'
+
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--run',type=Path,required=True);ap.add_argument('--phase',choices=['warmup','joint'],required=True)
     loading=ap.add_mutually_exclusive_group();loading.add_argument('--resume',type=Path);loading.add_argument('--initialize-from',type=Path)
@@ -189,7 +196,7 @@ def main():
         batch,selection=data.sample(step,rank,world,views)
         trainer.model.train();trainer.tot_it=step-1;trainer.step_timer.reset()
         slot=model.backbone.backbone.scene_tokens;before=int(trainer.optimizer.state.get(slot,{}).get('step',0))
-        grads={};hooks=[]
+        grads={};applied_grads={};hooks=[]
         tracked=['backbone.backbone.scene_tokens','scene_color_query.weight','gaussian_head.gaussian_head.1.weight']
         if a.phase=='joint':tracked+=['backbone.backbone.blocks.39.attn.qkv.weight']
         if conf.get('continuation'):tracked+=['backbone.backbone.blocks.18.attn.qkv.weight','backbone.backbone.blocks.29.attn.qkv.weight']
@@ -200,13 +207,26 @@ def main():
                     assert torch.isfinite(g).all(),f'Nonfinite gradient: {n}'
                     grads[n]=float(g.float().norm())/trainer.scaler.get_scale()
                 hooks.append(params[name].register_hook(capture))
+            def capture_optimizer_gradients(optimizer,args,kwargs):
+                # DDP reduction, AMP unscale and gradient clipping have completed.
+                for name in tracked:
+                    g=params[name].grad
+                    if g is not None:applied_grads[name]=float(g.detach().float().norm())
+            optimizer_hook=trainer.optimizer.register_step_pre_hook(capture_optimizer_gradients)
         pred,metrics=trainer.train_step(batch,log_grad_norm=True)
         for h in hooks:h.remove()
+        if hooks:optimizer_hook.remove()
         assert int(trainer.optimizer.state[slot]['step'])==before+1,'Optimizer update was skipped'
-        if hooks:assert len(grads)==len(tracked) and all(math.isfinite(v) and v>0 for v in grads.values())
+        if hooks:
+            observation=dict(step=step,rank=rank,selection=selection,local=grads,applied=applied_grads)
+            if set(grads)!=set(tracked) or any(v==0 for v in grads.values()):
+                with (root/f'gradient_observations_rank{rank}.jsonl').open('a') as f:f.write(json.dumps(observation)+'\n')
+            try:validate_gradient_observation(grads,applied_grads,tracked)
+            except AssertionError:
+                atomic(root/f'gradient_failure_rank{rank}.json',observation);raise
         values=floats(metrics);assert all(math.isfinite(v) for v in values.values()),'Nonfinite metrics'
         trainer.tot_it=step;trainer.tot_n_samples=step*world;torch.cuda.synchronize();seconds=time.perf_counter()-began
-        record=dict(step=step,phase=a.phase,views=views,selection=selection,metrics=values,gradients=grads,seconds=seconds,
+        record=dict(step=step,phase=a.phase,views=views,selection=selection,metrics=values,gradients=grads,optimizer_gradients=applied_grads,seconds=seconds,
             lr=[g['lr'] for g in trainer.optimizer.param_groups],memory_gib=torch.cuda.max_memory_allocated()/2**30)
         with (root/f'rank{rank}.jsonl').open('a') as f:f.write(json.dumps(record)+'\n')
         reduced=torch.tensor([values['loss/total'],values['psnr'],values['lpips'],seconds,values['loss/mse_loss'],values['loss/depth_loss'],values['loss/location_loss'],values['activated_pct']],device=trainer.device)
