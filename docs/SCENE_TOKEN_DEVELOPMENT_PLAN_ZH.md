@@ -360,3 +360,12 @@ v2验收passed：首50全卡连续更新、各项loss有限且非异常量级、
 
 - 恢复后已正常越过92700，最终核验status running/92740、无error_rank，159项源码hash一致。同一92700/rank2样本本次六个局部及汇总梯度均有限非零，loss .070228、activated .87636；未重现原断言，也没有局部零观察记录。不能声称已确定原故障是哪个参数的零梯度。本轮已修正不合理的逐卡非零判据并补齐诊断，但原始异常的具体数值原因未被精确复现。
 - gradient_fix_verification.json记录越过原失败步及完整该rank指标；模型结构/数据/loss/LR配置不变，训练继续后台运行，后续每2000步checkpoint策略保持。
+
+### 2026-09-09：确认并修复AMP梯度监控范数的FP32溢出
+
+- 新故障发生在93100/rank2，gradient_failure_rank2.json明确记录Gaussian head局部norm=inf，其他局部norm正常，实际用于优化器的该参数norm=.54744且其他汇总norm正常。局部hook逐元素isfinite断言先通过，随后g.float().norm()产生inf：这次根因是监控的FP32平方累加溢出，不是已发现梯度张量含Inf或优化器更新非有限。上一轮仅修正逐卡非零规则，没有解决此数值问题；不能继续归因于局部零梯度。
+- 92000 checkpoint的scaler.scale=4611686018427387904（2^62）、growth_interval2000。先计算scaled梯度FP32范数再除scale会在未缩放范数约4以上时溢出。改为torch.linalg.vector_norm(...,dtype=float64)累加后再除scale，同时对实际优化器范数用相同稳健函数；仍拦截真实非有限元素/非法scale、缺失hook和全局零梯度。未改变AMP scaler、模型、loss、LR、裁剪或优化器更新。新增日志amp_scale_before/after及失败记录中的scale。
+- 新增test_amp_gradient_norm.py四项通过，包含用实际checkpoint scale复现旧误报、真实CPU GradScaler保持正确更新、零/极小/极大有限值、真实NaN/Inf/非法scale拒绝。与原双进程DDP两项合计6项通过。
+- 额外在服务器H100上对3000000元素、同2^62缩放做数值回归：所有元素finite，旧norm溢出，新norm5.196152467873376，与先FP64解除缩放参考完全相同。报告gpu_amp_norm_regression.json，非额外模型训练实验。
+- 再次确认无活动训练进程后，将故障日志、gradient_failure、旧源码/provenance归档recovery_history/amp_norm_fix_1788962667，更新train_main及对应source快照和hash，在provenance.repairs保留完整原因。旧失败日志另由恢复管理器归档，不删除历史。
+- 从最近完整92000 checkpoint恢复，重算未保存的约1100步；新管理PID46864、torchrun46911，首步AMP scale与checkpoint一致、各监测量有限。已正常到92070、无error_rank；这次尚未重放到93100，修复依据是已复现的数值溢出及CPU/H100回归，不声称已越过本次原故障步。

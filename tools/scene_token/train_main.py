@@ -33,6 +33,12 @@ def migrate_optimizer(model,optimizer,saved):
     optimizer.load_state_dict(current)
     return matched
 
+def unscaled_gradient_norm(gradient,scale=1.):
+    """FP64 accumulation avoids squaring overflow in finite AMP-scaled gradients."""
+    if not math.isfinite(scale) or scale<=0:raise ValueError(f'Invalid AMP scale: {scale}')
+    if not torch.isfinite(gradient).all():raise FloatingPointError('Nonfinite gradient elements')
+    return float(torch.linalg.vector_norm(gradient.detach(),dtype=torch.float64))/scale
+
 def validate_gradient_observation(local,applied,tracked):
     """A rank-local zero is valid; require connected, finite optimizer gradients."""
     assert set(local)==set(tracked),f'Missing local gradient hooks: {set(tracked)-set(local)}'
@@ -196,7 +202,7 @@ def main():
         batch,selection=data.sample(step,rank,world,views)
         trainer.model.train();trainer.tot_it=step-1;trainer.step_timer.reset()
         slot=model.backbone.backbone.scene_tokens;before=int(trainer.optimizer.state.get(slot,{}).get('step',0))
-        grads={};applied_grads={};hooks=[]
+        grads={};applied_grads={};hooks=[];capture_scale=float(trainer.scaler.get_scale())
         tracked=['backbone.backbone.scene_tokens','scene_color_query.weight','gaussian_head.gaussian_head.1.weight']
         if a.phase=='joint':tracked+=['backbone.backbone.blocks.39.attn.qkv.weight']
         if conf.get('continuation'):tracked+=['backbone.backbone.blocks.18.attn.qkv.weight','backbone.backbone.blocks.29.attn.qkv.weight']
@@ -205,20 +211,20 @@ def main():
                 assert name in params,name
                 def capture(g,n=name):
                     assert torch.isfinite(g).all(),f'Nonfinite gradient: {n}'
-                    grads[n]=float(g.float().norm())/trainer.scaler.get_scale()
+                    grads[n]=unscaled_gradient_norm(g,capture_scale)
                 hooks.append(params[name].register_hook(capture))
             def capture_optimizer_gradients(optimizer,args,kwargs):
                 # DDP reduction, AMP unscale and gradient clipping have completed.
                 for name in tracked:
                     g=params[name].grad
-                    if g is not None:applied_grads[name]=float(g.detach().float().norm())
+                    if g is not None:applied_grads[name]=unscaled_gradient_norm(g)
             optimizer_hook=trainer.optimizer.register_step_pre_hook(capture_optimizer_gradients)
         pred,metrics=trainer.train_step(batch,log_grad_norm=True)
         for h in hooks:h.remove()
         if hooks:optimizer_hook.remove()
         assert int(trainer.optimizer.state[slot]['step'])==before+1,'Optimizer update was skipped'
         if hooks:
-            observation=dict(step=step,rank=rank,selection=selection,local=grads,applied=applied_grads)
+            observation=dict(step=step,rank=rank,selection=selection,local=grads,applied=applied_grads,amp_scale=capture_scale)
             if set(grads)!=set(tracked) or any(v==0 for v in grads.values()):
                 with (root/f'gradient_observations_rank{rank}.jsonl').open('a') as f:f.write(json.dumps(observation)+'\n')
             try:validate_gradient_observation(grads,applied_grads,tracked)
@@ -226,7 +232,7 @@ def main():
                 atomic(root/f'gradient_failure_rank{rank}.json',observation);raise
         values=floats(metrics);assert all(math.isfinite(v) for v in values.values()),'Nonfinite metrics'
         trainer.tot_it=step;trainer.tot_n_samples=step*world;torch.cuda.synchronize();seconds=time.perf_counter()-began
-        record=dict(step=step,phase=a.phase,views=views,selection=selection,metrics=values,gradients=grads,optimizer_gradients=applied_grads,seconds=seconds,
+        record=dict(step=step,phase=a.phase,views=views,selection=selection,metrics=values,gradients=grads,optimizer_gradients=applied_grads,amp_scale_before=capture_scale,amp_scale_after=float(trainer.scaler.get_scale()),seconds=seconds,
             lr=[g['lr'] for g in trainer.optimizer.param_groups],memory_gib=torch.cuda.max_memory_allocated()/2**30)
         with (root/f'rank{rank}.jsonl').open('a') as f:f.write(json.dumps(record)+'\n')
         reduced=torch.tensor([values['loss/total'],values['psnr'],values['lpips'],seconds,values['loss/mse_loss'],values['loss/depth_loss'],values['loss/location_loss'],values['activated_pct']],device=trainer.device)
