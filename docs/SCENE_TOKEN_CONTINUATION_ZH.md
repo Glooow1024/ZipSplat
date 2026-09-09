@@ -65,3 +65,11 @@ ssh vllm1 'cd /root/zipsplat/ZipSplat && rm /root/multiview_compare/experiments/
 若尚无本轮checkpoint，不能使用上述resume；需先诊断失败，按父checkpoint初始化路径重启管理器。旧main_v2已完成，不应在旧目录改总步数恢复。
 
 本轮进展以PROJECT_CONTEXT最新记录和远端status为准，部署不等于后续100k训练已完成。未提交/推送。
+
+### 2026-09-09：修复数据准备进度读取竞态并恢复管理程序
+
+- continue_20260909_v1 的训练管理程序在读取 progress.json 时发生 FileNotFoundError，此前单独 exists() 成功，文件在检查时已恢复可读。数据转换进程仍正常运行；故障发生时尚未启动新训练，无新增优化器更新，父50k checkpoint未受影响。
+- run_training.py改为直接读取，针对短暂不存在/不完整JSON/ESTALE、EIO、超时进行有限重试；暂时缺失时保留上次进度及其原始时间，连续5分钟没有有效心跳仍停止。最终summary也使用同一路径读取；持续损坏、权限错误及passed=false仍阻止启动。
+- tests/test_training_preparation_poll.py新增6项回归测试全部通过，覆盖文件短暂消失、旧心跳保留与过期、初次无文件超时、JSON重试/持续损坏、IO重试/权限失败和成功或失败的最终summary。
+- 已确认没有训练进程/metrics，再将旧status、pipeline日志、provenance和旧脚本归档到新运行recovery_history/poll_fix_1788919868；仅修正run_training.py及其对应源码快照/hash，provenance.pretraining_repairs明确记录前后hash和原因。159个冻结源码hash重新通过，没有放开校验或修改训练配置。
+- 已重启管理程序PID29969，viewer和8个转换worker未重启。检查时progress882/1056、0转换失败；网页回到preparing_data。数据完成后仍须通过审计、恢复重放和首50步验收；不把管理器恢复称为新训练已开始。

@@ -1,20 +1,44 @@
 """Detached pipeline: await prepared dataset, warmup, joint train; never auto-retry failures."""
-import argparse,fcntl,hashlib,json,os,shutil,subprocess,sys,time,traceback
+import argparse,errno,fcntl,hashlib,json,os,shutil,subprocess,sys,time,traceback
 from pathlib import Path
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]))
 from tools.scene_token.training_monitor import atomic,publish
+
+def read_preparation_json(path):
+    """Tolerate briefly unavailable shared-filesystem metadata, not permanent errors."""
+    for attempt in range(3):
+        try:return json.loads(path.read_text())
+        except FileNotFoundError:
+            if attempt==2:return None
+        except json.JSONDecodeError:
+            if attempt==2:raise
+        except OSError as error:
+            if error.errno not in {errno.ESTALE,errno.EIO,errno.ETIMEDOUT} or attempt==2:raise
+        time.sleep(.05*(attempt+1))
+
+def preparation_state(dataset,previous,wait_started,now=None):
+    # Read directly: exists() followed by read_text() races with remote replacement.
+    summary=read_preparation_json(dataset/'summary.json')
+    if summary is not None:return summary,previous
+    current=read_preparation_json(dataset/'progress.json')
+    progress=current if current is not None else previous
+    checked=time.time() if now is None else now
+    last_update=progress.get('updated',wait_started)
+    if checked-last_update>300:raise RuntimeError('Data preparation heartbeat stale or unavailable for 5 minutes')
+    return None,progress
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--run',type=Path,required=True);p.add_argument('--resume',action='store_true');a=p.parse_args();root=a.run
     lock=(root/'pipeline.lock').open('a');fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
     conf=json.loads((root/'config.json').read_text());dataset=Path(conf['dataset']);atomic(root/'pipeline.json',dict(pid=os.getpid(),started=time.time(),resume=a.resume))
-    while not (dataset/'summary.json').exists():
-        progress=json.loads((dataset/'progress.json').read_text()) if (dataset/'progress.json').exists() else {}
+    progress={};wait_started=time.time()
+    while True:
+        summary,progress=preparation_state(dataset,progress,wait_started)
+        if summary is not None:break
         publish(root,dict(state='preparing_data',phase='data',step=conf.get('continuation',{}).get('parent_step',0),total_steps=conf['total_steps'],updated=time.time(),message=f"数据准备 {progress.get('done',0)}/{progress.get('total',288)} 场景，失败 {progress.get('failed',0)}；完成后自动启动训练"))
-        if progress and time.time()-progress.get('updated',0)>300:raise RuntimeError('Data preparation heartbeat stale for 5 minutes')
         if (root/'STOP').exists():publish(root,dict(state='paused',phase='data',updated=time.time(),message='已取消自动启动；数据转换任务独立继续'));return
         time.sleep(10)
-    summary=json.loads((dataset/'summary.json').read_text());assert summary['passed'],summary
+    assert summary['passed'],summary
     if conf.get('continuation') and not (root/'runtime_check.json').exists():
         publish(root,dict(state='checking',phase='preflight',step=50000,total_steps=conf['total_steps'],updated=time.time(),message='数据审计通过，检查优化器恢复与真实采样'))
         with (root/'preflight.log').open('a') as f:
